@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import type {
   PacketScenario,
   ParseRequest,
@@ -7,6 +7,14 @@ import type {
   SimulatedPacket,
   TimelineEvent
 } from '../../shared/types';
+import {
+  clearSnapshot,
+  loadSnapshot,
+  saveSnapshot,
+  snapshotKey,
+  type ActiveView,
+  type WorkspaceSnapshot
+} from './workspaceSnapshots';
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:3001';
 
@@ -16,14 +24,23 @@ const scenarioLabels: Record<PacketScenario, string> = {
   handshake: '握手 / Handshake'
 };
 
+const DEFAULT_PROTOCOL: Protocol = 'HTTP';
+const DEFAULT_SCENARIO: PacketScenario = 'request';
+
 function App() {
-  const [protocol, setProtocol] = useState<Protocol>('HTTP');
-  const [scenario, setScenario] = useState<PacketScenario>('request');
+  const [protocol, setProtocol] = useState<Protocol>(DEFAULT_PROTOCOL);
+  const [scenario, setScenario] = useState<PacketScenario>(DEFAULT_SCENARIO);
   const [rawInput, setRawInput] = useState('');
   const [packet, setPacket] = useState<SimulatedPacket | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [activeView, setActiveView] = useState<'overview' | 'hex'>('overview');
+  const [activeView, setActiveView] = useState<ActiveView>('overview');
+  const [expandedFields, setExpandedFields] = useState<Record<string, boolean>>({});
+
+  /** 完成启动恢复后置为 true，之后的 state 变化才会写入快照 */
+  const hydratedRef = useRef(false);
+  /** 当前选中的快照键，用于丢弃切换场景后迟到的响应，避免污染其他场景的快照 */
+  const selectionRef = useRef(snapshotKey(DEFAULT_PROTOCOL, DEFAULT_SCENARIO));
 
   const availableScenarios = useMemo<PacketScenario[]>(
     () => (protocol === 'TCP' ? ['handshake', 'request', 'response'] : ['request', 'response']),
@@ -37,15 +54,18 @@ function App() {
   };
 
   const loadSample = async (nextProtocol = protocol, nextScenario = scenario) => {
+    const targetKey = snapshotKey(nextProtocol, nextScenario);
     setLoading(true);
     setError('');
     try {
       const result = await request(
         `/api/simulate?protocol=${nextProtocol}&scenario=${nextScenario}`
       );
+      if (selectionRef.current !== targetKey) return; // 场景已切换，丢弃迟到响应
       setPacket(result.data);
       setRawInput(result.data.raw);
     } catch (cause) {
+      if (selectionRef.current !== targetKey) return;
       setError(cause instanceof Error ? cause.message : '加载模拟数据失败');
     } finally {
       setLoading(false);
@@ -53,6 +73,7 @@ function App() {
   };
 
   const parsePacket = async () => {
+    const targetKey = snapshotKey(protocol, scenario);
     setLoading(true);
     setError('');
     const body: ParseRequest = { protocol, scenario, raw: rawInput };
@@ -62,29 +83,94 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
       });
+      if (selectionRef.current !== targetKey) return;
       setPacket(result.data);
       setRawInput(result.data.raw);
     } catch (cause) {
+      if (selectionRef.current !== targetKey) return;
       setError(cause instanceof Error ? cause.message : '解析数据包失败');
     } finally {
       setLoading(false);
     }
   };
 
+  // 启动时只恢复当前选中组合（HTTP / request）的快照，其余场景保持静默
   useEffect(() => {
-    void loadSample('HTTP', 'request');
+    const snapshot = loadSnapshot(DEFAULT_PROTOCOL, DEFAULT_SCENARIO);
+    if (snapshot) {
+      setRawInput(snapshot.rawInput);
+      setActiveView(snapshot.activeView);
+      setExpandedFields(snapshot.expandedFields);
+      setPacket(snapshot.packet);
+    } else {
+      void loadSample(DEFAULT_PROTOCOL, DEFAULT_SCENARIO);
+    }
+    hydratedRef.current = true;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 恢复完成后，当前组合的任何变化都按快照键写回存储
+  useEffect(() => {
+    if (!hydratedRef.current) return;
+    saveSnapshot({
+      protocol,
+      scenario,
+      rawInput,
+      activeView,
+      expandedFields,
+      packet,
+      updatedAt: Date.now()
+    });
+  }, [protocol, scenario, rawInput, activeView, expandedFields, packet]);
+
+  const applySnapshot = (snapshot: WorkspaceSnapshot) => {
+    setRawInput(snapshot.rawInput);
+    setActiveView(snapshot.activeView);
+    setExpandedFields(snapshot.expandedFields);
+    setPacket(snapshot.packet);
+    setError('');
+  };
+
+  const switchTo = (nextProtocol: Protocol, nextScenario: PacketScenario) => {
+    if (nextProtocol === protocol && nextScenario === scenario) return;
+    selectionRef.current = snapshotKey(nextProtocol, nextScenario);
+    setProtocol(nextProtocol);
+    setScenario(nextScenario);
+    const snapshot = loadSnapshot(nextProtocol, nextScenario);
+    if (snapshot) {
+      applySnapshot(snapshot);
+    } else {
+      setPacket(null);
+      setRawInput('');
+      setExpandedFields({});
+      setActiveView('overview');
+      setError('');
+      void loadSample(nextProtocol, nextScenario);
+    }
+  };
 
   const changeProtocol = (nextProtocol: Protocol) => {
     const nextScenario = nextProtocol === 'TCP' && scenario === 'response' ? 'handshake' : scenario;
-    setProtocol(nextProtocol);
-    setScenario(nextScenario);
-    void loadSample(nextProtocol, nextScenario);
+    switchTo(nextProtocol, nextScenario);
   };
 
   const changeScenario = (nextScenario: PacketScenario) => {
-    setScenario(nextScenario);
-    void loadSample(protocol, nextScenario);
+    switchTo(protocol, nextScenario);
+  };
+
+  /** 只清空当前协议 + 场景组合的快照，其他场景的内容不受影响 */
+  const resetScenario = () => {
+    clearSnapshot(protocol, scenario);
+    setPacket(null);
+    setRawInput('');
+    setExpandedFields({});
+    setActiveView('overview');
+    setError('');
+    void loadSample(protocol, scenario);
+  };
+
+  const toggleField = (id: string) => {
+    setExpandedFields((previous) => ({ ...previous, [id]: !(previous[id] ?? true) }));
   };
 
   return (
@@ -127,6 +213,7 @@ function App() {
           </div>
           <div className="control-actions">
             <button className="button ghost" onClick={() => void loadSample()} disabled={loading}>↻ 载入模拟包</button>
+            <button className="button ghost" onClick={resetScenario} disabled={loading}>清空此场景</button>
             <button className="button primary" onClick={() => void parsePacket()} disabled={loading || !rawInput.trim()}>{loading ? '处理中…' : '解析数据包 →'}</button>
           </div>
         </section>
@@ -159,7 +246,9 @@ function App() {
 
             <div className="panel details-panel">
               <div className="tabs"><button className={activeView === 'overview' ? 'selected' : ''} onClick={() => setActiveView('overview')}>协议字段树</button><button className={activeView === 'hex' ? 'selected' : ''} onClick={() => setActiveView('hex')}>十六进制视图</button></div>
-              {activeView === 'overview' ? <FieldTree fields={packet?.fields ?? []} /> : <HexView rows={packet?.hex ?? []} />}
+              {activeView === 'overview'
+                ? <FieldTree fields={packet?.fields ?? []} expandedFields={expandedFields} onToggleField={toggleField} />
+                : <HexView rows={packet?.hex ?? []} />}
             </div>
           </div>
         </section>
@@ -173,22 +262,35 @@ function Meta({ label, value }: { label: string; value: string }) {
   return <div className="meta-item"><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function FieldTree({ fields }: { fields: ProtocolField[] }) {
-  if (!fields.length) return <div className="empty-state">解析后将在这里显示协议层级字段。</div>;
-  return <div className="field-tree">{fields.map((field) => <FieldNode key={field.id} field={field} depth={0} />)}</div>;
+interface FieldTreeProps {
+  fields: ProtocolField[];
+  expandedFields: Record<string, boolean>;
+  onToggleField: (id: string) => void;
 }
 
-function FieldNode({ field, depth }: { field: ProtocolField; depth: number }) {
-  const [expanded, setExpanded] = useState(true);
+function FieldTree({ fields, expandedFields, onToggleField }: FieldTreeProps) {
+  if (!fields.length) return <div className="empty-state">解析后将在这里显示协议层级字段。</div>;
+  return <div className="field-tree">{fields.map((field) => <FieldNode key={field.id} field={field} depth={0} expandedFields={expandedFields} onToggleField={onToggleField} />)}</div>;
+}
+
+interface FieldNodeProps {
+  field: ProtocolField;
+  depth: number;
+  expandedFields: Record<string, boolean>;
+  onToggleField: (id: string) => void;
+}
+
+function FieldNode({ field, depth, expandedFields, onToggleField }: FieldNodeProps) {
+  const expanded = expandedFields[field.id] ?? true;
   const hasChildren = Boolean(field.children?.length);
   return <div className="field-node" style={{ '--depth': depth } as CSSProperties}>
-    <div className="field-row" onClick={() => hasChildren && setExpanded((value) => !value)}>
+    <div className="field-row" onClick={() => hasChildren && onToggleField(field.id)}>
       <span className={`chevron ${hasChildren ? '' : 'invisible'} ${expanded ? 'open' : ''}`}>⌄</span>
       <span className="field-key">{field.key}</span>
       <span className="field-value">{field.value}</span>
       <span className="field-description">{field.description}</span>
     </div>
-    {hasChildren && expanded && <div className="field-children">{field.children!.map((child) => <FieldNode key={child.id} field={child} depth={depth + 1} />)}</div>}
+    {hasChildren && expanded && <div className="field-children">{field.children!.map((child) => <FieldNode key={child.id} field={child} depth={depth + 1} expandedFields={expandedFields} onToggleField={onToggleField} />)}</div>}
   </div>;
 }
 
